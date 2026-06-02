@@ -1,5 +1,4 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { ArrowLeft, CheckCircle, Loader2, ShieldAlert } from 'lucide-react'
 import CameraView from './CameraView'
 import type { CameraViewHandle } from './CameraView'
 import { detectFace, cosineSimilarity } from '../lib/faceEngine'
@@ -10,305 +9,259 @@ import { getUsers, addAuditLog } from '../lib/db'
 import type { EnrolledUser } from '../lib/db'
 import { v4 as uuid } from '../lib/uuid'
 
-interface Props {
-  onBack: () => void
-}
-
+interface Props { onBack: () => void }
 type Stage = 'scanning' | 'liveness' | 'matching' | 'success' | 'fail'
-
-const AUTH_THRESHOLD = 0.45
+const THRESHOLD = 0.45
 
 export default function AuthFlow({ onBack }: Props) {
   const [stage, setStage] = useState<Stage>('scanning')
-  const [faceDetected, setFaceDetected] = useState(false)
-  const [cameraActive, setCameraActive] = useState(false)
-  const [matchedUser, setMatchedUser] = useState<EnrolledUser | null>(null)
-  const [similarity, setSimilarity] = useState(0)
-  const [failReason, setFailReason] = useState('')
+  const [face, setFace]   = useState(false)
+  const [camOn, setCamOn] = useState(false)
+  const [matched, setMatched] = useState<EnrolledUser|null>(null)
+  const [sim, setSim]     = useState(0)
+  const [fail, setFail]   = useState('')
+  const [ear, setEar]     = useState({ l:0, r:0, base:0 })
 
-  // Liveness state lives in a ref so the rAF loop is never stale
-  const livenessRef = useRef<LivenessState>(createLivenessState(true))
-  const [livenessUI, setLivenessUI] = useState<LivenessState>(livenessRef.current)
+  const livRef = useRef<LivenessState>(createLivenessState(true))
+  const [livUI, setLivUI] = useState(livRef.current)
+  const camRef = useRef<CameraViewHandle>(null)
+  const raf    = useRef(0)
+  const busy   = useRef(false)
+  const stgRef = useRef<Stage>('scanning')
+  const matchStarted = useRef(false)
 
-  const cameraRef = useRef<CameraViewHandle>(null)
-  const animFrameRef = useRef<number>(0)
-  const processingRef = useRef(false)
-  const stageRef = useRef<Stage>('scanning')
-  // Capture one descriptor once liveness passes; avoid running matching twice
-  const matchingStarted = useRef(false)
+  function go(s: Stage) { stgRef.current = s; setStage(s) }
 
-  function setStageSync(s: Stage) {
-    stageRef.current = s
-    setStage(s)
-  }
-
-  const runLoop = useCallback(async () => {
-    if (processingRef.current) {
-      animFrameRef.current = requestAnimationFrame(runLoop)
-      return
-    }
-
-    const video = cameraRef.current?.getVideo()
-    if (!video || video.readyState < 2) {
-      animFrameRef.current = requestAnimationFrame(runLoop)
-      return
-    }
-
-    processingRef.current = true
+  const loop = useCallback(async () => {
+    if (busy.current) { raf.current = requestAnimationFrame(loop); return }
+    const v = camRef.current?.getVideo()
+    if (!v || v.readyState < 2) { raf.current = requestAnimationFrame(loop); return }
+    busy.current = true
     try {
-      const result = await detectFace(video)
-      setFaceDetected(result.detected)
-
-      if (result.detected && result.landmarks && result.descriptor) {
-        const currentStage = stageRef.current
-
-        if (currentStage === 'scanning') {
-          setStageSync('liveness')
-
-        } else if (currentStage === 'liveness') {
-          const noseTip  = result.landmarks.positions[30]
-          const leftEye  = result.landmarks.positions[36]
-          const rightEye = result.landmarks.positions[45]
-
-          const { state: newState, advancedChallenge } = updateLiveness(livenessRef.current, {
-            earLeft:   result.earLeft,
-            earRight:  result.earRight,
-            earAvg:    result.earAvg,
-            noseTipX:  noseTip.x,
-            leftEyeX:  leftEye.x,
-            rightEyeX: rightEye.x,
+      const r = await detectFace(v)
+      setFace(r.detected)
+      if (r.detected && r.landmarks && r.descriptor) {
+        setEar({ l: r.earLeft, r: r.earRight, base: livRef.current.earBaseline })
+        const cur = stgRef.current
+        if (cur === 'scanning') { go('liveness') }
+        else if (cur === 'liveness') {
+          const n = r.landmarks.positions
+          const { state: ns, advancedChallenge } = updateLiveness(livRef.current, {
+            earLeft: r.earLeft, earRight: r.earRight, earAvg: r.earAvg,
+            noseTipX: n[30].x, leftEyeX: n[36].x, rightEyeX: n[45].x,
           })
-
-          livenessRef.current = newState
-          if (advancedChallenge) setLivenessUI({ ...newState })
-
-          if (newState.passed && !matchingStarted.current) {
-            matchingStarted.current = true
-            setStageSync('matching')
-            await runMatching(Array.from(result.descriptor))
-            return
+          livRef.current = ns
+          if (advancedChallenge) setLivUI({ ...ns })
+          if (ns.passed && !matchStarted.current) {
+            matchStarted.current = true; go('matching')
+            await doMatch(Array.from(r.descriptor)); return
           }
         }
       }
-    } finally {
-      processingRef.current = false
-    }
-
-    animFrameRef.current = requestAnimationFrame(runLoop)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // intentionally empty — live values via refs
+    } finally { busy.current = false }
+    raf.current = requestAnimationFrame(loop)
+  }, [])
 
   useEffect(() => {
-    if ((stageRef.current === 'scanning' || stageRef.current === 'liveness') && cameraActive) {
-      animFrameRef.current = requestAnimationFrame(runLoop)
-    }
-    return () => cancelAnimationFrame(animFrameRef.current)
-  }, [stage, cameraActive, runLoop])
+    if ((stgRef.current === 'scanning' || stgRef.current === 'liveness') && camOn)
+      raf.current = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf.current)
+  }, [stage, camOn, loop])
 
-  async function runMatching(queryEmbedding: number[]) {
+  async function doMatch(q: number[]) {
     try {
       const users = await getUsers()
-      if (users.length === 0) {
-        setFailReason('No enrolled users found. Please enroll first.')
-        setStageSync('fail')
-        return
+      if (!users.length) { setFail('No enrolled users. Enroll first.'); go('fail'); return }
+      let best: EnrolledUser|null = null; let bestS = -1
+      for (const u of users) {
+        const s = cosineSimilarity(q, await decryptEmbedding(u.encryptedEmbedding))
+        if (s > bestS) { bestS = s; best = u }
       }
-
-      let bestMatch: EnrolledUser | null = null
-      let bestSim = -1
-
-      for (const user of users) {
-        const stored = await decryptEmbedding(user.encryptedEmbedding)
-        const sim = cosineSimilarity(queryEmbedding, stored)
-        if (sim > bestSim) { bestSim = sim; bestMatch = user }
-      }
-
-      const hash = await hashEmbedding(queryEmbedding)
-      setSimilarity(bestSim)
-
-      if (bestSim >= AUTH_THRESHOLD && bestMatch) {
-        setMatchedUser(bestMatch)
-        setStageSync('success')
-        await addAuditLog({
-          id: uuid(), userId: bestMatch.id, userName: bestMatch.name,
-          action: 'AUTH_SUCCESS', timestamp: Date.now(),
-          embeddingHash: hash, similarity: bestSim, synced: false,
-        })
+      const hash = await hashEmbedding(q); setSim(bestS)
+      if (bestS >= THRESHOLD && best) {
+        setMatched(best); go('success')
+        await addAuditLog({ id:uuid(), userId:best.id, userName:best.name, action:'AUTH_SUCCESS', timestamp:Date.now(), embeddingHash:hash, similarity:bestS, synced:false })
       } else {
-        setFailReason(`Identity could not be verified. Similarity: ${(bestSim * 100).toFixed(1)}%`)
-        setStageSync('fail')
-        await addAuditLog({
-          id: uuid(), userId: bestMatch?.id ?? 'unknown', userName: bestMatch?.name ?? 'Unknown',
-          action: 'AUTH_FAIL', timestamp: Date.now(),
-          embeddingHash: hash, similarity: bestSim, synced: false,
-        })
+        setFail(`Best similarity ${(bestS*100).toFixed(1)}% — below threshold`); go('fail')
+        await addAuditLog({ id:uuid(), userId:best?.id??'-', userName:best?.name??'Unknown', action:'AUTH_FAIL', timestamp:Date.now(), embeddingHash:hash, similarity:bestS, synced:false })
       }
-    } catch {
-      setFailReason('Matching error. Please try again.')
-      setStageSync('fail')
-    }
+    } catch { setFail('Match error — retry.'); go('fail') }
   }
 
   function retry() {
-    const fresh = createLivenessState(true)
-    livenessRef.current = fresh
-    setLivenessUI(fresh)
-    matchingStarted.current = false
-    setFaceDetected(false)
-    setMatchedUser(null)
-    setSimilarity(0)
-    setFailReason('')
-    setStageSync('scanning')
+    livRef.current = createLivenessState(true); setLivUI(livRef.current)
+    matchStarted.current = false
+    setFace(false); setMatched(null); setSim(0); setFail(''); go('scanning')
   }
 
   return (
-    <div className="min-h-screen bg-black flex flex-col">
-      <div className="flex items-center gap-3 p-4 border-b border-zinc-900">
-        <button onClick={onBack} className="p-2 rounded-lg hover:bg-zinc-900 transition-colors">
-          <ArrowLeft className="w-5 h-5 text-white" />
+    <div className="flex flex-col min-h-screen bg-[#f2f2f7]">
+
+      {/* Header */}
+      <div className="bg-white px-4 py-3 flex items-center gap-3 border-b border-[#e5e5ea]/60">
+        <button onClick={onBack} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-[#f2f2f7] transition-colors">
+          <svg className="w-5 h-5 text-[#1c1c1e]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" />
+          </svg>
         </button>
-        <div>
-          <h2 className="text-white font-semibold text-sm">Verify Identity</h2>
-          <p className="text-zinc-600 text-xs">Offline biometric authentication</p>
-        </div>
-        <div className="ml-auto">
-          <div className={`w-2 h-2 rounded-full ${faceDetected ? 'bg-white' : 'bg-zinc-800'} transition-colors`} />
-        </div>
+        <p className="flex-1 text-[15px] font-semibold text-[#1c1c1e]">Verify Identity</p>
+        <span className={`w-2 h-2 rounded-full ${face ? 'bg-[#34c759]' : 'bg-[#e5e5ea]'} transition-colors`} />
       </div>
 
-      <div className="flex-1 flex flex-col">
-        {(stage === 'scanning' || stage === 'liveness') && (
-          <div className="flex-1 flex flex-col">
-            <div className="relative flex-1 bg-zinc-950 overflow-hidden" style={{ minHeight: '400px' }}>
-              <CameraView
-                ref={cameraRef}
-                onStream={setCameraActive}
-                className="w-full h-full object-cover absolute inset-0"
-                mirror={true}
-              />
-              <div className="scanline absolute inset-0" />
+      {/* CAMERA */}
+      {(stage === 'scanning' || stage === 'liveness') && (
+        <div className="flex-1 flex flex-col">
+          <div className="relative bg-black overflow-hidden" style={{ flex:'1 1 0', minHeight:'55vh' }}>
+            <CameraView ref={camRef} onStream={setCamOn} className="absolute inset-0 w-full h-full object-cover" mirror />
+            <div className="absolute bottom-0 inset-x-0 h-32 bg-gradient-to-t from-black/50 to-transparent" />
 
-              <div className="absolute inset-0 flex items-center justify-center">
-                <div className={`face-oval w-44 h-56 sm:w-52 sm:h-64 ${faceDetected ? 'detected' : ''}`} />
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className={`face-oval ${face ? 'liveness' : ''}`}
+                style={{ width:'min(70vw,260px)', height:'min(88vw,330px)' }} />
+            </div>
+            <div className="cam-corner tl" /><div className="cam-corner tr" />
+            <div className="cam-corner bl" /><div className="cam-corner br" />
+
+            <div className="absolute top-4 inset-x-0 flex justify-center">
+              {stage === 'scanning' ? (
+                <div className="bg-black/70 backdrop-blur-md rounded-full px-4 py-2 flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-white blink-dot" />
+                  <span className="text-white text-[13px] font-semibold">Position your face</span>
+                </div>
+              ) : (
+                <div className="bg-black/70 backdrop-blur-md rounded-full px-4 py-2 flex items-center gap-2">
+                  <span className="text-white text-[14px]">{getChallengeIcon(livUI.currentChallenge)}</span>
+                  <span className="text-white text-[13px] font-semibold">{getChallengeText(livUI.currentChallenge)}</span>
+                </div>
+              )}
+            </div>
+
+            {/* EAR diag */}
+            {stage === 'liveness' && face && livUI.currentChallenge === 'BLINK' && livUI.baselineFrames >= 12 && (
+              <div className="absolute top-[52px] inset-x-0 flex justify-center">
+                <span className="text-[10px] text-white/40 font-mono bg-black/40 px-2 py-0.5 rounded">
+                  EAR {ear.l.toFixed(2)} / {ear.r.toFixed(2)} — close below {Math.max(ear.base*0.78, ear.base-0.05).toFixed(2)}
+                </span>
               </div>
+            )}
 
-              <div className="camera-corner tl" />
-              <div className="camera-corner tr" />
-              <div className="camera-corner bl" />
-              <div className="camera-corner br" />
-
-              {stage === 'scanning' && (
-                <div className="absolute top-4 inset-x-4 flex justify-center">
-                  <div className="bg-black/80 backdrop-blur-sm border border-zinc-800 rounded-full px-4 py-2 flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-white blink" />
-                    <span className="text-white text-sm">Position your face</span>
-                  </div>
-                </div>
-              )}
-
-              {stage === 'liveness' && (
-                <div className="absolute top-4 inset-x-4 flex justify-center">
-                  <div className="bg-black/80 backdrop-blur-sm border border-zinc-800 rounded-full px-4 py-2 flex items-center gap-2">
-                    <span className="text-lg">{getChallengeIcon(livenessUI.currentChallenge)}</span>
-                    <span className="text-white text-sm font-medium">{getChallengeText(livenessUI.currentChallenge)}</span>
-                  </div>
-                </div>
-              )}
-
-              {/* EAR live readout — helps confirm detection is working */}
-              {stage === 'liveness' && faceDetected && (
-                <div className="absolute bottom-20 inset-x-4 flex justify-center">
-                  <div className="bg-black/60 px-3 py-1 rounded text-xs text-zinc-500 font-mono">
-                    blink challenge active — close both eyes fully
-                  </div>
-                </div>
-              )}
-
-              {stage === 'liveness' && (
-                <div className="absolute bottom-4 inset-x-4">
-                  <div className="flex justify-center gap-2 flex-wrap">
-                    {livenessUI.challenges.map((c, i) => (
-                      <div
-                        key={c}
-                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs transition-all ${
-                          i < livenessUI.challengeIndex ? 'bg-white text-black'
-                          : i === livenessUI.challengeIndex ? 'bg-zinc-800 text-white border border-zinc-600'
-                          : 'bg-zinc-900 text-zinc-600'
-                        }`}
-                      >
-                        {i < livenessUI.challengeIndex && <CheckCircle className="w-3 h-3" />}
-                        {getChallengeText(c)}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {stage === 'matching' && (
-          <div className="flex-1 flex flex-col items-center justify-center p-6 space-y-6 slide-up">
-            <div className="w-16 h-16 rounded-full border border-zinc-800 flex items-center justify-center">
-              <Loader2 className="w-8 h-8 text-white animate-spin" />
-            </div>
-            <div className="text-center">
-              <h3 className="text-white font-semibold">Matching identity</h3>
-              <p className="text-zinc-500 text-sm mt-1">Running cosine similarity on-device</p>
-            </div>
-          </div>
-        )}
-
-        {stage === 'success' && matchedUser && (
-          <div className="flex-1 flex flex-col items-center justify-center p-6 space-y-6 slide-up">
-            <div className="relative">
-              <div className="w-24 h-24 rounded-full bg-white flex items-center justify-center">
-                <span className="text-3xl font-bold text-black">{matchedUser.avatarInitials}</span>
+            {stage === 'liveness' && face && livUI.baselineFrames < 20 && (
+              <div className="absolute top-[52px] inset-x-0 flex justify-center">
+                <span className="text-[11px] text-white/50 bg-black/40 px-2 py-0.5 rounded">
+                  Calibrating ({livUI.baselineFrames}/20)
+                </span>
               </div>
-              <div className="absolute -bottom-1 -right-1 w-8 h-8 rounded-full bg-black border-2 border-black flex items-center justify-center">
-                <CheckCircle className="w-7 h-7 text-white" />
-              </div>
-            </div>
-            <div className="text-center">
-              <h3 className="text-2xl font-bold text-white">{matchedUser.name}</h3>
-              <p className="text-zinc-500 text-sm">{matchedUser.role}</p>
-            </div>
-            <div className="w-full max-w-xs border border-zinc-800 rounded-xl divide-y divide-zinc-900">
-              {[
-                ['Status', 'Verified'],
-                ['Match confidence', `${(similarity * 100).toFixed(1)}%`],
-                ['Method', 'Cosine similarity'],
-                ['Timestamp', new Date().toLocaleTimeString()],
-              ].map(([k, v]) => (
-                <div key={k} className="flex justify-between px-4 py-2.5">
-                  <span className="text-zinc-600 text-xs">{k}</span>
-                  <span className="text-white text-xs font-mono">{v}</span>
-                </div>
-              ))}
-            </div>
-            <div className="flex gap-3 w-full max-w-xs">
-              <button onClick={retry} className="flex-1 py-3 border border-zinc-800 text-white font-medium rounded-xl text-sm hover:bg-zinc-900 transition-colors">Verify Again</button>
-              <button onClick={onBack} className="flex-1 py-3 bg-white text-black font-semibold rounded-xl text-sm hover:bg-zinc-100 transition-colors">Done</button>
-            </div>
-          </div>
-        )}
+            )}
 
-        {stage === 'fail' && (
-          <div className="flex-1 flex flex-col items-center justify-center p-6 space-y-6 slide-up">
-            <div className="w-20 h-20 rounded-full border border-zinc-800 flex items-center justify-center">
-              <ShieldAlert className="w-10 h-10 text-zinc-400" />
+            {stage === 'liveness' && (
+              <div className="absolute bottom-4 inset-x-3 flex justify-center gap-1.5 flex-wrap">
+                {livUI.challenges.map((c, i) => (
+                  <div key={c} className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-[11px] font-semibold transition-all ${
+                    i < livUI.challengeIndex ? 'bg-white text-[#1c1c1e]'
+                    : i === livUI.challengeIndex ? 'bg-white/20 text-white border border-white/30'
+                    : 'bg-white/8 text-white/35'}`}>
+                    {i < livUI.challengeIndex && (
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
+                    )}
+                    {getChallengeText(c)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="bg-white px-5 py-3 border-t border-[#e5e5ea]/60">
+            <p className="text-[12px] text-[#8e8e93] text-center">
+              {!face ? 'Look straight at the camera' : `Step ${livUI.challengeIndex + 1}/${livUI.challenges.length}`}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* MATCHING */}
+      {stage === 'matching' && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 gap-5 fade-up">
+          <div className="w-14 h-14 rounded-2xl bg-[#f2f2f7] flex items-center justify-center">
+            <svg className="w-6 h-6 text-[#8e8e93] spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+            </svg>
+          </div>
+          <div className="text-center">
+            <p className="text-[17px] font-semibold text-[#1c1c1e]">Matching</p>
+            <p className="text-[13px] text-[#8e8e93] mt-1">Running cosine similarity on-device</p>
+          </div>
+        </div>
+      )}
+
+      {/* SUCCESS */}
+      {stage === 'success' && matched && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 gap-5 fade-up">
+          <div className="relative">
+            <div className="w-20 h-20 rounded-full bg-[#1c1c1e] flex items-center justify-center">
+              <span className="text-white text-2xl font-bold">{matched.avatarInitials}</span>
             </div>
-            <div className="text-center">
-              <h3 className="text-xl font-bold text-white">Verification Failed</h3>
-              <p className="text-zinc-500 text-sm mt-2 max-w-xs">{failReason}</p>
-            </div>
-            <div className="flex gap-3 w-full max-w-xs">
-              <button onClick={onBack} className="flex-1 py-3 border border-zinc-800 text-white font-medium rounded-xl text-sm hover:bg-zinc-900 transition-colors">Cancel</button>
-              <button onClick={retry} className="flex-1 py-3 bg-white text-black font-semibold rounded-xl text-sm hover:bg-zinc-100 transition-colors">Retry</button>
+            <div className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full bg-[#34c759] flex items-center justify-center border-2 border-white">
+              <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+              </svg>
             </div>
           </div>
-        )}
-      </div>
+          <div className="text-center">
+            <p className="text-[22px] font-semibold text-[#1c1c1e]">{matched.name}</p>
+            <p className="text-[14px] text-[#8e8e93] mt-0.5">{matched.role}</p>
+          </div>
+          <div className="card w-full max-w-xs overflow-hidden divide-y divide-[#f2f2f7]">
+            {[
+              ['Status', 'Verified'],
+              ['Confidence', `${(sim * 100).toFixed(1)}%`],
+              ['Method', 'Cosine similarity'],
+              ['Time', new Date().toLocaleTimeString()],
+            ].map(([k, v]) => (
+              <div key={k} className="flex justify-between px-4 py-3">
+                <span className="text-[12px] text-[#aeaeb2]">{k}</span>
+                <span className="text-[12px] font-semibold text-[#1c1c1e]">{v}</span>
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2.5 w-full max-w-xs">
+            <button onClick={retry}
+              className="flex-1 h-[50px] bg-[#f2f2f7] text-[#1c1c1e] text-[15px] font-semibold rounded-2xl active:opacity-80 transition-opacity">
+              Again
+            </button>
+            <button onClick={onBack}
+              className="flex-1 h-[50px] bg-[#1c1c1e] text-white text-[15px] font-semibold rounded-2xl active:opacity-80 transition-opacity">
+              Done
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* FAIL */}
+      {stage === 'fail' && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 gap-5 fade-up">
+          <div className="w-16 h-16 rounded-2xl bg-[#f2f2f7] flex items-center justify-center">
+            <svg className="w-7 h-7 text-[#aeaeb2]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+            </svg>
+          </div>
+          <div className="text-center">
+            <p className="text-[17px] font-semibold text-[#1c1c1e]">Not Verified</p>
+            <p className="text-[13px] text-[#8e8e93] mt-2 max-w-[260px]">{fail}</p>
+          </div>
+          <div className="flex gap-2.5 w-full max-w-xs">
+            <button onClick={onBack}
+              className="flex-1 h-[50px] bg-[#f2f2f7] text-[#1c1c1e] text-[15px] font-semibold rounded-2xl active:opacity-80 transition-opacity">
+              Cancel
+            </button>
+            <button onClick={retry}
+              className="flex-1 h-[50px] bg-[#1c1c1e] text-white text-[15px] font-semibold rounded-2xl active:opacity-80 transition-opacity">
+              Retry
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

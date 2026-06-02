@@ -9,31 +9,14 @@ type View = 'loading' | 'dashboard' | 'enroll' | 'auth'
 
 export default function App() {
   const [view, setView] = useState<View>('loading')
-
   const onModelsLoaded = useCallback(() => setView('dashboard'), [])
 
-  function handleEnrollSuccess(_user: EnrolledUser) {
-    setView('dashboard')
-  }
-
   return (
-    <>
-      {view === 'loading' && <ModelLoader onLoaded={onModelsLoaded} />}
-      {view === 'dashboard' && (
-        <Dashboard
-          onEnroll={() => setView('enroll')}
-          onAuth={() => setView('auth')}
-        />
-      )}
-      {view === 'enroll' && (
-        <EnrollFlow
-          onBack={() => setView('dashboard')}
-          onSuccess={handleEnrollSuccess}
-        />
-      )}
-      {view === 'auth' && (
-        <AuthFlow onBack={() => setView('dashboard')} />
-      )}
-    </>
+    <div className="app-shell">
+      {view === 'loading'    && <ModelLoader onLoaded={onModelsLoaded} />}
+      {view === 'dashboard'  && <Dashboard onEnroll={() => setView('enroll')} onAuth={() => setView('auth')} />}
+      {view === 'enroll'     && <EnrollFlow onBack={() => setView('dashboard')} onSuccess={(_u: EnrolledUser) => setView('dashboard')} />}
+      {view === 'auth'       && <AuthFlow onBack={() => setView('dashboard')} />}
+    </div>
   )
 }

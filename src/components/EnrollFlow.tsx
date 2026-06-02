@@ -1,5 +1,4 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { ArrowLeft, User, Briefcase, CheckCircle, Loader2, AlertCircle } from 'lucide-react'
 import CameraView from './CameraView'
 import type { CameraViewHandle } from './CameraView'
 import { detectFace, averageEmbeddings } from '../lib/faceEngine'
@@ -10,375 +9,276 @@ import { saveUser, addAuditLog } from '../lib/db'
 import type { EnrolledUser } from '../lib/db'
 import { v4 as uuid } from '../lib/uuid'
 
-interface Props {
-  onBack: () => void
-  onSuccess: (user: EnrolledUser) => void
-}
-
-type Stage = 'form' | 'liveness' | 'capture' | 'processing' | 'done'
-
-const NEEDED_CAPTURES = 5
+interface Props { onBack: () => void; onSuccess: (u: EnrolledUser) => void }
+type Stage = 'form' | 'camera' | 'processing' | 'done'
+const CAPTURES = 5
 
 export default function EnrollFlow({ onBack, onSuccess }: Props) {
-  const [name, setName] = useState('')
-  const [role, setRole] = useState('')
+  const [name, setName]   = useState('')
+  const [role, setRole]   = useState('')
   const [stage, setStage] = useState<Stage>('form')
+  const [camOn, setCamOn] = useState(false)
+  const [face, setFace]   = useState(false)
+  const [caps, setCaps]   = useState(0)
+  const [err, setErr]     = useState<string|null>(null)
+  const [done, setDone]   = useState<EnrolledUser|null>(null)
+  const [ear, setEar]     = useState({ l:0, r:0, base:0 })
 
-  // Liveness: keep real state in a ref so the rAF loop never captures a stale closure.
-  // livenessUI is only for rendering — updated only when the challenge actually advances.
-  const livenessRef = useRef<LivenessState>(createLivenessState(true))
-  const [livenessUI, setLivenessUI] = useState<LivenessState>(livenessRef.current)
+  const livRef    = useRef<LivenessState>(createLivenessState(true))
+  const [livUI, setLivUI] = useState(livRef.current)
+  const camRef    = useRef<CameraViewHandle>(null)
+  const embs      = useRef<Float32Array[]>([])
+  const raf       = useRef(0)
+  const busy      = useRef(false)
+  const stgRef    = useRef<Stage>('form')
+  const phase     = useRef<'liveness'|'capture'>('liveness')
 
-  const [cameraActive, setCameraActive] = useState(false)
-  const [captureCount, setCaptureCount] = useState(0)
-  const [faceDetected, setFaceDetected] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [enrolledUser, setEnrolledUser] = useState<EnrolledUser | null>(null)
+  function go(s: Stage) { stgRef.current = s; setStage(s) }
 
-  const cameraRef = useRef<CameraViewHandle>(null)
-  const capturedEmbeddings = useRef<Float32Array[]>([])
-  const animFrameRef = useRef<number>(0)
-  const processingRef = useRef(false)
-  // Track stage in a ref too so the rAF callback always reads the current value
-  const stageRef = useRef<Stage>('form')
-
-  function setStageSync(s: Stage) {
-    stageRef.current = s
-    setStage(s)
-  }
-
-  // Single continuous detection loop — reads from refs, never from closed-over state
-  const runDetectionLoop = useCallback(async () => {
-    if (processingRef.current) {
-      animFrameRef.current = requestAnimationFrame(runDetectionLoop)
-      return
-    }
-
-    const video = cameraRef.current?.getVideo()
-    if (!video || video.readyState < 2) {
-      animFrameRef.current = requestAnimationFrame(runDetectionLoop)
-      return
-    }
-
-    processingRef.current = true
+  const loop = useCallback(async () => {
+    if (busy.current) { raf.current = requestAnimationFrame(loop); return }
+    const v = camRef.current?.getVideo()
+    if (!v || v.readyState < 2) { raf.current = requestAnimationFrame(loop); return }
+    busy.current = true
     try {
-      const result = await detectFace(video)
-      setFaceDetected(result.detected)
-
-      if (result.detected && result.landmarks && result.descriptor) {
-        const currentStage = stageRef.current
-
-        if (currentStage === 'liveness') {
-          const noseTip  = result.landmarks.positions[30]
-          const leftEye  = result.landmarks.positions[36]
-          const rightEye = result.landmarks.positions[45]
-
-          const { state: newState, advancedChallenge } = updateLiveness(livenessRef.current, {
-            earLeft:   result.earLeft  ?? 0.3,
-            earRight:  result.earRight ?? 0.3,
-            earAvg:    result.earAvg   ?? 0.3,
-            noseTipX:  noseTip.x,
-            leftEyeX:  leftEye.x,
-            rightEyeX: rightEye.x,
+      const r = await detectFace(v)
+      setFace(r.detected)
+      if (r.detected && r.landmarks && r.descriptor) {
+        setEar({ l: r.earLeft, r: r.earRight, base: livRef.current.earBaseline })
+        if (phase.current === 'liveness') {
+          const n = r.landmarks.positions
+          const { state: ns, advancedChallenge } = updateLiveness(livRef.current, {
+            earLeft: r.earLeft, earRight: r.earRight, earAvg: r.earAvg,
+            noseTipX: n[30].x, leftEyeX: n[36].x, rightEyeX: n[45].x,
           })
-
-          livenessRef.current = newState
-          // Only re-render when something the user sees has changed
-          if (advancedChallenge) setLivenessUI({ ...newState })
-
-          if (newState.passed) {
-            setStageSync('capture')
-          }
-
-        } else if (currentStage === 'capture') {
-          capturedEmbeddings.current.push(result.descriptor)
-          const count = capturedEmbeddings.current.length
-          setCaptureCount(count)
-          if (count >= NEEDED_CAPTURES) {
-            setStageSync('processing')
-            await finishEnrollment()
-            return
-          }
-          await new Promise(r => setTimeout(r, 250))
+          livRef.current = ns
+          if (advancedChallenge) setLivUI({ ...ns })
+          if (ns.passed) phase.current = 'capture'
+        } else {
+          embs.current.push(r.descriptor)
+          const c = embs.current.length; setCaps(c)
+          if (c >= CAPTURES) { go('processing'); await finish(); return }
+          await new Promise(r => setTimeout(r, 200))
         }
       }
-    } finally {
-      processingRef.current = false
-    }
+    } finally { busy.current = false }
+    raf.current = requestAnimationFrame(loop)
+  }, [])
 
-    animFrameRef.current = requestAnimationFrame(runDetectionLoop)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // intentionally empty — we read live values via refs
-
-  // Start / stop the loop when stage or camera readiness changes
   useEffect(() => {
-    if ((stageRef.current === 'liveness' || stageRef.current === 'capture') && cameraActive) {
-      animFrameRef.current = requestAnimationFrame(runDetectionLoop)
-    }
-    return () => cancelAnimationFrame(animFrameRef.current)
-  }, [stage, cameraActive, runDetectionLoop])
+    if (stage === 'camera' && camOn) raf.current = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf.current)
+  }, [stage, camOn, loop])
 
-  async function finishEnrollment() {
+  async function finish() {
     try {
-      const avgEmbedding = averageEmbeddings(capturedEmbeddings.current)
-      const encrypted = await encryptEmbedding(avgEmbedding)
-      const hash = await hashEmbedding(avgEmbedding)
+      const avg = averageEmbeddings(embs.current)
+      const enc = await encryptEmbedding(avg)
+      const hash = await hashEmbedding(avg)
       const id = uuid()
       const user: EnrolledUser = {
-        id,
-        name,
-        role,
-        encryptedEmbedding: encrypted,
-        deviceFingerprint: navigator.userAgent.substring(0, 64),
+        id, name, role, encryptedEmbedding: enc,
+        deviceFingerprint: navigator.userAgent.slice(0, 64),
         enrolledAt: Date.now(),
-        avatarInitials: name.split(' ').map(w => w[0]).join('').substring(0, 2).toUpperCase(),
+        avatarInitials: name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase(),
       }
       await saveUser(user)
-      await addAuditLog({
-        id: uuid(),
-        userId: id,
-        userName: name,
-        action: 'ENROLL',
-        timestamp: Date.now(),
-        embeddingHash: hash,
-        synced: false,
-      })
-      setEnrolledUser(user)
-      setStageSync('done')
+      await addAuditLog({ id: uuid(), userId: id, userName: name, action: 'ENROLL', timestamp: Date.now(), embeddingHash: hash, synced: false })
+      setDone(user); go('done')
     } catch {
-      setError('Enrollment failed. Please try again.')
-      const fresh = createLivenessState(true)
-      livenessRef.current = fresh
-      setLivenessUI(fresh)
-      capturedEmbeddings.current = []
-      setCaptureCount(0)
-      setStageSync('liveness')
+      setErr('Enrollment failed. Please try again.')
+      livRef.current = createLivenessState(true); setLivUI(livRef.current)
+      phase.current = 'liveness'; embs.current = []; setCaps(0); go('camera')
     }
   }
 
-  function startLiveness() {
-    if (!name.trim() || !role.trim()) {
-      setError('Please enter your name and role.')
-      return
-    }
-    setError(null)
-    const fresh = createLivenessState(true)
-    livenessRef.current = fresh
-    setLivenessUI(fresh)
-    setStageSync('liveness')
+  function begin() {
+    if (!name.trim() || !role.trim()) { setErr('Enter name and role.'); return }
+    setErr(null)
+    livRef.current = createLivenessState(true); setLivUI(livRef.current)
+    phase.current = 'liveness'; go('camera')
   }
 
-  const stageSteps: Stage[] = ['form', 'liveness', 'capture', 'processing', 'done']
+  const isCapture = livUI.passed
 
   return (
-    <div className="min-h-screen bg-black flex flex-col">
+    <div className="flex flex-col min-h-screen bg-[#f2f2f7]">
+
       {/* Header */}
-      <div className="flex items-center gap-3 p-4 border-b border-zinc-900">
-        <button onClick={onBack} className="p-2 rounded-lg hover:bg-zinc-900 transition-colors">
-          <ArrowLeft className="w-5 h-5 text-white" />
+      <div className="bg-white px-4 py-3 flex items-center gap-3 border-b border-[#e5e5ea]/60">
+        <button onClick={onBack} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-[#f2f2f7] transition-colors">
+          <svg className="w-5 h-5 text-[#1c1c1e]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" />
+          </svg>
         </button>
-        <div>
-          <h2 className="text-white font-semibold text-sm">Enroll Face</h2>
-          <p className="text-zinc-600 text-xs">One-time biometric registration</p>
+        <div className="flex-1">
+          <p className="text-[15px] font-semibold text-[#1c1c1e]">Enroll Face</p>
         </div>
-        <div className="ml-auto flex gap-1">
-          {stageSteps.map((s, i) => (
-            <div
-              key={s}
-              className={`w-1.5 h-1.5 rounded-full transition-colors ${
-                stageSteps.indexOf(stage) >= i ? 'bg-white' : 'bg-zinc-800'
-              }`}
-            />
+        <div className="flex gap-1">
+          {(['form','camera','processing','done'] as Stage[]).map((s, i) => (
+            <div key={s} className={`h-1 rounded-full transition-all duration-300 ${
+              (['form','camera','processing','done'] as Stage[]).indexOf(stage) >= i
+                ? 'w-4 bg-[#1c1c1e]' : 'w-1.5 bg-[#e5e5ea]'}`} />
           ))}
         </div>
       </div>
 
-      <div className="flex-1 flex flex-col">
-        {/* STAGE: Form */}
-        {stage === 'form' && (
-          <div className="flex-1 flex flex-col justify-center p-6 max-w-sm mx-auto w-full space-y-6 slide-up">
+      {/* FORM */}
+      {stage === 'form' && (
+        <div className="flex-1 flex flex-col justify-center p-5 fade-up">
+          <div className="space-y-6 max-w-sm mx-auto w-full">
             <div>
-              <h3 className="text-xl font-bold text-white">Who are you?</h3>
-              <p className="text-zinc-500 text-sm mt-1">Your identity, stored only on this device</p>
+              <h2 className="text-[22px] font-semibold text-[#1c1c1e] tracking-tight">Who are you?</h2>
+              <p className="text-[13px] text-[#8e8e93] mt-1">Identity stored only on this device</p>
             </div>
             <div className="space-y-3">
-              <div className="relative">
-                <User className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-600" />
-                <input
-                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl pl-9 pr-4 py-3 text-white text-sm placeholder-zinc-600 focus:outline-none focus:border-zinc-600 transition-colors"
-                  placeholder="Full name"
-                  value={name}
-                  onChange={e => setName(e.target.value)}
-                />
-              </div>
-              <div className="relative">
-                <Briefcase className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-600" />
-                <input
-                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl pl-9 pr-4 py-3 text-white text-sm placeholder-zinc-600 focus:outline-none focus:border-zinc-600 transition-colors"
-                  placeholder="Role (e.g. Field Officer)"
-                  value={role}
-                  onChange={e => setRole(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && startLiveness()}
-                />
-              </div>
+              <input className="w-full card px-4 h-[50px] text-[15px] text-[#1c1c1e] placeholder-[#c7c7cc] focus:outline-none focus:ring-2 focus:ring-[#1c1c1e]/10"
+                placeholder="Full name" value={name} onChange={e => setName(e.target.value)} />
+              <input className="w-full card px-4 h-[50px] text-[15px] text-[#1c1c1e] placeholder-[#c7c7cc] focus:outline-none focus:ring-2 focus:ring-[#1c1c1e]/10"
+                placeholder="Role (e.g. Field Officer)" value={role} onChange={e => setRole(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && begin()} />
             </div>
-            {error && (
-              <div className="flex items-center gap-2 text-zinc-400 text-xs">
-                <AlertCircle className="w-4 h-4 shrink-0" />
-                {error}
+            {err && <p className="text-[13px] text-[#ff3b30]">{err}</p>}
+            <button onClick={begin} disabled={!name.trim()||!role.trim()}
+              className="w-full h-[50px] bg-[#1c1c1e] text-white text-[15px] font-semibold rounded-2xl disabled:opacity-30 active:opacity-80 transition-opacity">
+              Begin Enrollment
+            </button>
+            <div className="card p-4">
+              <p className="text-[12px] text-[#8e8e93] leading-relaxed">
+                <span className="font-semibold text-[#636366]">Privacy first.</span> Raw images are never saved.
+                Only a 128-dim encrypted embedding is stored locally via AES-256-GCM.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CAMERA */}
+      {stage === 'camera' && (
+        <div className="flex-1 flex flex-col">
+          <div className="relative bg-black overflow-hidden" style={{ flex: '1 1 0', minHeight: '55vh' }}>
+            <CameraView ref={camRef} onStream={setCamOn} className="absolute inset-0 w-full h-full object-cover" mirror />
+            <div className="absolute bottom-0 inset-x-0 h-32 bg-gradient-to-t from-black/50 to-transparent" />
+
+            {/* Large oval */}
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className={`face-oval ${face ? (isCapture ? 'success' : 'liveness') : ''}`}
+                style={{ width: 'min(70vw, 260px)', height: 'min(88vw, 330px)' }} />
+            </div>
+
+            <div className="cam-corner tl" /><div className="cam-corner tr" />
+            <div className="cam-corner bl" /><div className="cam-corner br" />
+
+            {/* Top pill */}
+            <div className="absolute top-4 inset-x-0 flex justify-center">
+              {!isCapture ? (
+                <div className="bg-black/70 backdrop-blur-md rounded-full px-4 py-2 flex items-center gap-2">
+                  <span className="text-white text-[14px]">{getChallengeIcon(livUI.currentChallenge)}</span>
+                  <span className="text-white text-[13px] font-semibold">{getChallengeText(livUI.currentChallenge)}</span>
+                </div>
+              ) : (
+                <div className="bg-black/70 backdrop-blur-md rounded-full px-4 py-2 flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-white blink-dot" />
+                  <span className="text-white text-[13px] font-semibold">Capturing {caps}/{CAPTURES}</span>
+                </div>
+              )}
+            </div>
+
+            {/* EAR diag during blink */}
+            {!isCapture && face && livUI.currentChallenge === 'BLINK' && livUI.baselineFrames >= 12 && (
+              <div className="absolute top-[52px] inset-x-0 flex justify-center">
+                <span className="text-[10px] text-white/40 font-mono bg-black/40 px-2 py-0.5 rounded">
+                  EAR {ear.l.toFixed(2)} / {ear.r.toFixed(2)} — close below {Math.max(ear.base * 0.78, ear.base - 0.05).toFixed(2)}
+                </span>
               </div>
             )}
-            <button
-              onClick={startLiveness}
-              disabled={!name.trim() || !role.trim()}
-              className="w-full py-3 bg-white text-black font-semibold rounded-xl text-sm disabled:opacity-30 disabled:cursor-not-allowed hover:bg-zinc-100 transition-colors"
-            >
-              Begin Face Enrollment
-            </button>
-            <div className="border border-zinc-900 rounded-xl p-3 space-y-1.5">
-              <p className="text-xs text-zinc-500 font-medium">Privacy guaranteed</p>
-              <p className="text-xs text-zinc-700">Raw images are never stored. Only a 128-dimension encrypted math vector is saved locally using AES-256-GCM.</p>
-            </div>
-          </div>
-        )}
 
-        {/* STAGE: Liveness / Capture */}
-        {(stage === 'liveness' || stage === 'capture') && (
-          <div className="flex-1 flex flex-col">
-            <div className="relative flex-1 bg-zinc-950 overflow-hidden" style={{ minHeight: '400px' }}>
-              <CameraView
-                ref={cameraRef}
-                onStream={setCameraActive}
-                className="w-full h-full object-cover absolute inset-0"
-                mirror={true}
-              />
-              <div className="scanline absolute inset-0" />
-
-              {/* Face oval guide */}
-              <div className="absolute inset-0 flex items-center justify-center">
-                <div
-                  className={`face-oval w-44 h-56 sm:w-52 sm:h-64 ${
-                    faceDetected
-                      ? stage === 'capture' ? 'success' : 'detected'
-                      : ''
-                  }`}
-                />
+            {/* Calibrating */}
+            {!isCapture && face && livUI.baselineFrames < 20 && (
+              <div className="absolute top-[52px] inset-x-0 flex justify-center">
+                <span className="text-[11px] text-white/50 bg-black/40 px-2 py-0.5 rounded">
+                  Calibrating… keep eyes open ({livUI.baselineFrames}/20)
+                </span>
               </div>
+            )}
 
-              {/* Corner brackets */}
-              <div className="camera-corner tl" />
-              <div className="camera-corner tr" />
-              <div className="camera-corner bl" />
-              <div className="camera-corner br" />
-
-              {/* Challenge pill */}
-              {stage === 'liveness' && (
-                <div className="absolute top-4 inset-x-4 flex justify-center">
-                  <div className="bg-black/80 backdrop-blur-sm border border-zinc-800 rounded-full px-4 py-2 flex items-center gap-2">
-                    <span className="text-lg">{getChallengeIcon(livenessUI.currentChallenge)}</span>
-                    <span className="text-white text-sm font-medium">{getChallengeText(livenessUI.currentChallenge)}</span>
+            {/* Step chips */}
+            {!isCapture && (
+              <div className="absolute bottom-4 inset-x-3 flex justify-center gap-1.5 flex-wrap">
+                {livUI.challenges.map((c, i) => (
+                  <div key={c} className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-[11px] font-semibold transition-all ${
+                    i < livUI.challengeIndex ? 'bg-white text-[#1c1c1e]'
+                    : i === livUI.challengeIndex ? 'bg-white/20 text-white border border-white/30'
+                    : 'bg-white/8 text-white/35'}`}>
+                    {i < livUI.challengeIndex ? (
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
+                    ) : null}
+                    {getChallengeText(c)}
                   </div>
-                </div>
-              )}
-
-              {/* EAR debug (dev only) */}
-              {stage === 'liveness' && (
-                <div className="absolute bottom-20 inset-x-4 flex justify-center">
-                  <div className="bg-black/60 px-3 py-1 rounded text-xs text-zinc-400 font-mono">
-                    {faceDetected ? `EAR L:${(livenessRef.current as any)._dbgEarL?.toFixed(2) ?? '–'}  R:${(livenessRef.current as any)._dbgEarR?.toFixed(2) ?? '–'}` : 'No face'}
-                  </div>
-                </div>
-              )}
-
-              {/* Capture progress */}
-              {stage === 'capture' && (
-                <div className="absolute top-4 inset-x-4 flex justify-center">
-                  <div className="bg-black/80 backdrop-blur-sm border border-zinc-800 rounded-full px-4 py-2 flex items-center gap-3">
-                    <div className="w-2 h-2 rounded-full bg-white blink" />
-                    <span className="text-white text-sm font-medium">Capturing {captureCount}/{NEEDED_CAPTURES}</span>
-                  </div>
-                </div>
-              )}
-
-              {/* Liveness step chips */}
-              {stage === 'liveness' && (
-                <div className="absolute bottom-4 inset-x-4">
-                  <div className="flex justify-center gap-2 flex-wrap">
-                    {livenessUI.challenges.map((c, i) => (
-                      <div
-                        key={c}
-                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs transition-all ${
-                          i < livenessUI.challengeIndex
-                            ? 'bg-white text-black'
-                            : i === livenessUI.challengeIndex
-                            ? 'bg-zinc-800 text-white border border-zinc-600'
-                            : 'bg-zinc-900 text-zinc-600'
-                        }`}
-                      >
-                        {i < livenessUI.challengeIndex && <CheckCircle className="w-3 h-3" />}
-                        {getChallengeText(c)}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
-        )}
 
-        {/* STAGE: Processing */}
-        {stage === 'processing' && (
-          <div className="flex-1 flex flex-col items-center justify-center p-6 space-y-6 slide-up">
-            <div className="w-16 h-16 rounded-full border border-zinc-800 flex items-center justify-center">
-              <Loader2 className="w-8 h-8 text-white animate-spin" />
-            </div>
-            <div className="text-center">
-              <h3 className="text-white font-semibold">Processing biometrics</h3>
-              <p className="text-zinc-500 text-sm mt-1">Encrypting and storing your template</p>
-            </div>
-            <div className="w-full max-w-xs space-y-2">
-              {['Averaging 5 embeddings', 'AES-256-GCM encrypt', 'Writing to local store'].map((step, i) => (
-                <div key={step} className="flex items-center gap-3">
-                  <div className="w-1.5 h-1.5 rounded-full bg-white shimmer" style={{ animationDelay: `${i * 0.3}s` }} />
-                  <span className="text-zinc-500 text-xs">{step}</span>
-                </div>
-              ))}
-            </div>
+          {/* Status bar */}
+          <div className="bg-white px-5 py-3 border-t border-[#e5e5ea]/60">
+            <p className="text-[12px] text-[#8e8e93] text-center">
+              {!face ? 'Position your face in the oval'
+                : !isCapture ? `Step ${livUI.challengeIndex + 1}/${livUI.challenges.length}`
+                : 'Hold still — capturing embeddings'}
+            </p>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* STAGE: Done */}
-        {stage === 'done' && enrolledUser && (
-          <div className="flex-1 flex flex-col items-center justify-center p-6 space-y-6 slide-up">
-            <div className="w-20 h-20 rounded-full bg-white flex items-center justify-center">
-              <CheckCircle className="w-10 h-10 text-black" />
-            </div>
-            <div className="text-center">
-              <h3 className="text-2xl font-bold text-white">Enrolled!</h3>
-              <p className="text-zinc-500 text-sm mt-1">{enrolledUser.name} — {enrolledUser.role}</p>
-            </div>
-            <div className="w-full max-w-xs border border-zinc-800 rounded-xl divide-y divide-zinc-900">
-              {[
-                ['Status', 'Active'],
-                ['Template', '128-dim AES encrypted'],
-                ['Storage', 'Local device only'],
-                ['Enrolled', new Date(enrolledUser.enrolledAt).toLocaleString()],
-              ].map(([k, v]) => (
-                <div key={k} className="flex justify-between px-4 py-2.5">
-                  <span className="text-zinc-600 text-xs">{k}</span>
-                  <span className="text-white text-xs font-mono">{v}</span>
-                </div>
-              ))}
-            </div>
-            <button
-              onClick={() => onSuccess(enrolledUser)}
-              className="w-full max-w-xs py-3 bg-white text-black font-semibold rounded-xl text-sm hover:bg-zinc-100 transition-colors"
-            >
-              Continue to Dashboard
-            </button>
+      {/* PROCESSING */}
+      {stage === 'processing' && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 gap-5 fade-up">
+          <div className="w-14 h-14 rounded-2xl bg-[#f2f2f7] flex items-center justify-center">
+            <svg className="w-6 h-6 text-[#8e8e93] spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+            </svg>
           </div>
-        )}
-      </div>
+          <div className="text-center">
+            <p className="text-[17px] font-semibold text-[#1c1c1e]">Processing</p>
+            <p className="text-[13px] text-[#8e8e93] mt-1">Encrypting biometric template</p>
+          </div>
+        </div>
+      )}
+
+      {/* DONE */}
+      {stage === 'done' && done && (
+        <div className="flex-1 flex flex-col items-center justify-center p-6 gap-5 fade-up">
+          <div className="w-16 h-16 rounded-full bg-[#1c1c1e] flex items-center justify-center">
+            <svg className="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+            </svg>
+          </div>
+          <div className="text-center">
+            <p className="text-[22px] font-semibold text-[#1c1c1e]">Enrolled</p>
+            <p className="text-[14px] text-[#8e8e93] mt-1">{done.name} · {done.role}</p>
+          </div>
+          <div className="card w-full max-w-xs overflow-hidden divide-y divide-[#f2f2f7]">
+            {[
+              ['Status', 'Active'],
+              ['Template', '128-dim · AES-256'],
+              ['Storage', 'Device only'],
+              ['Date', new Date(done.enrolledAt).toLocaleString()],
+            ].map(([k, v]) => (
+              <div key={k} className="flex justify-between px-4 py-3">
+                <span className="text-[12px] text-[#aeaeb2]">{k}</span>
+                <span className="text-[12px] font-medium text-[#1c1c1e]">{v}</span>
+              </div>
+            ))}
+          </div>
+          <button onClick={() => onSuccess(done)}
+            className="w-full max-w-xs h-[50px] bg-[#1c1c1e] text-white text-[15px] font-semibold rounded-2xl active:opacity-80 transition-opacity">
+            Go to Dashboard
+          </button>
+        </div>
+      )}
     </div>
   )
 }

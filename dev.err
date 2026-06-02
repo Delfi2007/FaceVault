@@ -172,3 +172,30 @@ Sourcemap for "D:/FaceVault/node_modules/face-api.js/build/es6/faceFeatureExtrac
 Sourcemap for "D:/FaceVault/node_modules/face-api.js/build/es6/mtcnn/sharedLayers.js" points to missing source files
 Sourcemap for "D:/FaceVault/node_modules/face-api.js/build/es6/common/extractSeparableConvParamsFactory.js" points to missing source files
 Sourcemap for "D:/FaceVault/node_modules/face-api.js/build/es6/faceFeatureExtractor/loadParamsFactory.js" points to missing source files
+[2m7:00:01 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:01:31 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:02:01 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:02:32 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:03:02 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:08:45 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:10:07 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:11:16 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.
+[2m7:11:33 pm[22m [31m[1m[vite][22m[39m [31m[2m(client)[22m[39m [2m[console.error] [22mEach child in a list should have a unique "key" prop.
+
+Check the render method of `Dashboard`. See https://react.dev/link/warning-keys for more information.

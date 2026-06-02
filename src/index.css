@@ -1,125 +1,97 @@
 @import "tailwindcss";
 
-* {
-  box-sizing: border-box;
-}
+*, *::before, *::after { box-sizing: border-box; }
+html { height: 100%; }
 
 body {
-  margin: 0;
-  background: #000;
-  color: #fff;
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  height: 100%;
+  background: #f2f2f7;
+  color: #1c1c1e;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
 }
 
 #root {
   min-height: 100svh;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* ── Phone shell ─────────────────────────────────────────────── */
+.app-shell {
+  width: 100%;
+  min-height: 100svh;
+  background: #f2f2f7;
   display: flex;
   flex-direction: column;
 }
-
-/* Scanline overlay for cameras */
-.scanline {
-  background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(255,255,255,0.015) 2px,
-    rgba(255,255,255,0.015) 4px
-  );
-  pointer-events: none;
+@media (min-width: 640px) {
+  #root { padding: 40px 16px; justify-content: center; }
+  .app-shell {
+    max-width: 400px;
+    min-height: 720px;
+    max-height: calc(100svh - 80px);
+    border-radius: 38px;
+    box-shadow:
+      0 0 0 1px rgba(0,0,0,0.05),
+      0 24px 80px rgba(0,0,0,0.16);
+    overflow: hidden;
+  }
 }
 
-/* Corner brackets for camera UI */
-.camera-corner {
-  position: absolute;
-  width: 24px;
-  height: 24px;
-  border-color: white;
-  border-style: solid;
-}
-.camera-corner.tl { top: 12px; left: 12px; border-width: 2px 0 0 2px; }
-.camera-corner.tr { top: 12px; right: 12px; border-width: 2px 2px 0 0; }
-.camera-corner.bl { bottom: 12px; left: 12px; border-width: 0 0 2px 2px; }
-.camera-corner.br { bottom: 12px; right: 12px; border-width: 0 2px 2px 0; }
+/* ── Camera ─────────────────────────────────────────────────── */
+video.mirror  { transform: scaleX(-1); }
 
-/* Face detection oval */
-@keyframes pulse-ring {
-  0% { box-shadow: 0 0 0 0 rgba(255,255,255,0.3); }
-  70% { box-shadow: 0 0 0 12px rgba(255,255,255,0); }
-  100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+@keyframes pulse-oval {
+  0%,100% { box-shadow: 0 0 0 0 rgba(255,255,255,0.25); }
+  50%      { box-shadow: 0 0 0 12px rgba(255,255,255,0); }
 }
-
 .face-oval {
-  border: 2px solid rgba(255,255,255,0.6);
+  border: 2px solid rgba(255,255,255,0.5);
   border-radius: 50% / 60%;
-  animation: pulse-ring 2s ease-in-out infinite;
+  animation: pulse-oval 2.5s ease-in-out infinite;
+  transition: border-color 0.3s, box-shadow 0.3s;
 }
-
-.face-oval.detected {
-  border-color: #fff;
-  animation: pulse-ring 1s ease-in-out infinite;
-}
-
+.face-oval.detected { border-color: rgba(255,255,255,0.85); }
+.face-oval.liveness { border-color: #fff; animation-duration: 1.2s; }
 .face-oval.success {
-  border-color: #22c55e;
-  box-shadow: 0 0 24px rgba(34,197,94,0.4);
+  border-color: #34c759;
+  box-shadow: 0 0 40px rgba(52,199,89,0.35);
   animation: none;
 }
 
-/* Progress bar shimmer */
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
+.cam-corner {
+  position: absolute;
+  width: 20px; height: 20px;
+  border-color: rgba(255,255,255,0.7);
+  border-style: solid;
+}
+.cam-corner.tl { top:16px; left:16px; border-width:2px 0 0 2px; border-radius:2px 0 0 0; }
+.cam-corner.tr { top:16px; right:16px; border-width:2px 2px 0 0; border-radius:0 2px 0 0; }
+.cam-corner.bl { bottom:16px; left:16px; border-width:0 0 2px 2px; border-radius:0 0 0 2px; }
+.cam-corner.br { bottom:16px; right:16px; border-width:0 2px 2px 0; border-radius:0 0 2px 0; }
+
+/* ── Animations ──────────────────────────────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fadeUp 0.3s cubic-bezier(.25,.46,.45,.94) forwards; }
+
+@keyframes blink-dot { 0%,100%{opacity:1} 50%{opacity:.15} }
+.blink-dot { animation: blink-dot 1s ease-in-out infinite; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin .8s linear infinite; }
+
+/* ── iOS-style card ──────────────────────────────────────────── */
+.card {
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 0 0 0.5px rgba(0,0,0,0.04), 0 1px 3px rgba(0,0,0,0.06);
 }
 
-.shimmer {
-  background: linear-gradient(90deg, #333 25%, #555 50%, #333 75%);
-  background-size: 200% 100%;
-  animation: shimmer 1.5s infinite;
-}
-
-/* Dot blink for active states */
-@keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.2; }
-}
-
-.blink { animation: blink 1.2s ease-in-out infinite; }
-
-/* Slide up animation */
-@keyframes slideUp {
-  from { opacity: 0; transform: translateY(16px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.slide-up { animation: slideUp 0.4s ease forwards; }
-
-/* Card hover */
-.card-hover {
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
-}
-.card-hover:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 32px rgba(255,255,255,0.08);
-}
-
-/* Custom scrollbar */
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: #111; }
-::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
-::-webkit-scrollbar-thumb:hover { background: #555; }
-
-/* Gradient text */
-.gradient-text {
-  background: linear-gradient(135deg, #fff 0%, #888 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-/* Video mirror */
-video.mirror { transform: scaleX(-1); }
-
-canvas.mirror { transform: scaleX(-1); }
+/* ── Scrollbar ───────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 0; height: 0; }

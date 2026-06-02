@@ -13,7 +13,7 @@
     "@tailwindcss/vite": "^4.3.0",
     "@tensorflow-models/face-landmarks-detection": "^1.0.6",
     "@tensorflow/tfjs": "^4.22.0",
-    "face-api.js": "^0.22.2",
+    "@vladmandic/face-api": "^1.7.15",
     "idb": "^8.0.3",
     "lucide-react": "^1.17.0",
     "react": "^19.2.6",
